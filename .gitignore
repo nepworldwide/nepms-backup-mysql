@@ -1,0 +1,9 @@
+# Idea
+.idea/
+
+# Virtualenv
+venv/
+
+.DS_Store
+# Do not include the config
+app/conf.json
