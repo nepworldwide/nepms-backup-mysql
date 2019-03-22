@@ -1,0 +1,71 @@
+{
+  "database": {
+    "host": "127.0.0.1",
+    "db": "zabbix",
+    "user": "root",
+    "password": ""
+  },
+  "prometheus": {
+    "enabled": true,
+    "host": "prometheus-pushgateway.pvc.com",
+    "job": "zabbix_db_backup"
+  },
+  "aws": {
+    "enabled": true,
+    "bucket": "backup",
+    "path": "zabbix-db",
+    "access_key": "secret",
+    "secret_key": "secret"
+  },
+  "backup": {
+    "mysqldump_bin": "mysqldump",
+    "output_dir": "/data/db/backups/",
+    "keep_local_backups": 3,
+    "jobs": [
+      {
+        "name": "db_schema",
+        "type": "schema",
+        "enabled": true,
+        "compression": true
+      },
+      {
+        "name": "db_config",
+        "type": "data",
+        "enabled": true,
+        "compression": true,
+        "exclude": [
+          "history",
+          "history_uint",
+          "history_log",
+          "history_str",
+          "history_text",
+          "acknowledges",
+          "alerts",
+          "auditlog",
+          "events",
+          "trends",
+          "trends_uint"
+        ]
+      },
+      {
+        "name": "db_data",
+        "type": "data",
+        "enabled": false,
+        "compression": true,
+        "include": [
+          "history",
+          "history_uint",
+          "history_log",
+          "history_str",
+          "history_text",
+          "acknowledges",
+          "alerts",
+          "auditlog",
+          "events",
+          "trends",
+          "trends_uint"
+        ]
+      }
+    ]
+  }
+}

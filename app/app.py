@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import sys
 import os
+from stat import S_ISREG, ST_CTIME, ST_MODE
 import logging as log
 import argparse
 import datetime as dt
@@ -10,6 +11,8 @@ import json
 from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
 from boto3.s3.transfer import S3Transfer
 import boto3
+from glob import glob
+import shutil
 
 
 # Helper function to get the script dir
@@ -51,65 +54,116 @@ def log_level_switch(log_level):
     }[log_level]
 
 
+# Retention
+def delete_old_backups(backup_root_dir, keep_count):
+
+    log.info(f"Retention is enabled, checking for old dirs")
+    # get all entries in the directory
+    backup_dirs = [os.path.join(backup_root_dir, dir_name) for dir_name in os.listdir(backup_root_dir) if os.path.isdir(os.path.join(backup_root_dir, dir_name))]
+    dir_count = len(backup_dirs)
+    # Check if there are more directories than we need to keep
+    if dir_count > keep_count:
+        log.info(f"Backup directory has {dir_count} dirs. Starting cleanup.")
+        # Sort directories by modified time
+        backup_dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+        # Get directories to be removed
+        old_backup_dirs = backup_dirs[keep_count:]
+        log.info(f"Following directories will be removed: {old_backup_dirs}")
+        # For every directory we need to remove
+        for d in old_backup_dirs:
+            # Remove it
+            shutil.rmtree(d, ignore_errors=True)
+            log.info(f"Following directory has been removed: '{d}'")
+    else:
+        log.info(f"Backup directory has {dir_count} dirs. Not enough for cleanup to do anything.")
+
+
 # Read JSON file and returns the loaded dict
 def get_json_conf(json_file):
     try:
         log.info(f'Reading conf file "{json_file}"')
         with open(json_file, 'r') as f:
-            conf = json.load(f)
+            configuration = json.load(f)
     except Exception as e:
         log.error(f'Could not read the file: {e}')
         sys.exit(1)
 
-    log.debug(f'Read conf "{json.dumps(conf)}"')
-    return conf
+    log.debug(f'Read conf "{json.dumps(configuration)}"')
+    return configuration
 
 
 # Actual backup
 # With mysqldump binary
-def run_job(conf):
+def run_job(configuration):
 
-    name = conf['name']
-    output_dir = conf['out']
-    util = conf['util']
-    host = conf['host']
-    db = conf['db']
-    db_user = conf['user']
-    db_pass = conf['password']
-    dump_type = conf['type']
+    name = configuration['name']
+    job_backup_dir = configuration['output_dir']
+    mysqldump_bin = configuration['mysqldump_bin']
+    host = configuration['host']
+    db = configuration['db']
+    db_user = configuration['user']
+    db_pass = configuration['password']
+    tables_include = configuration['include']
+    tables_exclude = configuration['exclude']
+    dump_type = configuration['type']
+    compression = configuration['compression']
 
-    compression = conf['compression']
-    if 'included' in conf:
-        tables_included = conf['included']
-    if 'excluded' in conf:
-        tables_excluded = conf['excluded']
+    create_dir_cmd = f"mkdir -p {job_backup_dir}"
 
-    # TODO add inclusion and exclusion
-    filename = f"{name}.sql"
-    output = f"{output_dir}/{filename}"
-    schema_only_flags = '--no-data -R -E' if dump_type == 'schema' else ''
+    # Construct mysqldump options string
+    mysqldump_opts_args = ['--single-transaction']
+    if dump_type == 'schema':
+        mysqldump_opts_args.append('--no-data --triggers --routines --events')
+    if dump_type == 'data':
+        mysqldump_opts_args.append('--no-create-info --skip-triggers')
+    mysqldump_opts = ' '.join(mysqldump_opts_args)
 
-    create_dir_cmd = f"mkdir -p {output_dir}"
+    # Construct mysqldump connection string
+    db_connect_conf_args = []
+    if host != '':
+        db_connect_conf_args.append(f"-h{host}")
+    if db_user != '':
+        db_connect_conf_args.append(f"-u{db_user}")
     if db_pass != '':
-        db_dump_cmd = f"{util} -h {host} -u {db_user} -p{db_pass} {schema_only_flags} --single-transaction  {db} > {output}"
-    else:
-        db_dump_cmd = f"{util} -h {host} -u {db_user} {schema_only_flags} --single-transaction {db} > {output}"
+        db_connect_conf_args.append(f"-p{db_pass}")
+    db_connect_conf = ' '.join(db_connect_conf_args)
+
+    # Construct mysqldump objects
+    # Default value is the database name
+    object_filter = db
+    if tables_include:
+        log.info("Job has 'include' tables")
+        object_filter = f"{db} " + ' '.join(f"{table}" for table in tables_include)
+
+    # Excluded tables take priority, as it overwires the object_filter var
+    if tables_exclude:
+        log.info("Job has 'exclude' tables")
+        object_filter = ' '.join(f"--ignore-table={db}.{table}" for table in tables_exclude) + f" {db}"
+
+    # Output file path string
+    filename = f"{name}.sql"
+    output = f"{job_backup_dir}/{filename}"
+
+    # Construct mysqldump command string
+    db_dump_cmd = f"{mysqldump_bin} {db_connect_conf} {mysqldump_opts} {object_filter} > {output}"
 
     job_start_time = time.time()
     try:
         # Create dir
-        log.info(f"Running dump for job: {conf['name']}")
+        log.info(f"Running dump for job: {configuration['name']}")
+        log.info(f"Creating dump directory: {job_backup_dir}")
+        log.debug(f"Creating dump directory: [{create_dir_cmd}]")
         check_output(create_dir_cmd, stderr=STDOUT, shell=True)
         # Dump
         dump_start_time = time.time()
         log.info(f"Creating dump file: '{output}'")
+        log.debug(f"Creating dump file cmd: [{db_dump_cmd}]")
         check_output(db_dump_cmd, stderr=STDOUT, shell=True)
         dump_size = os.stat(output).st_size
         dump_duration = round((time.time() - dump_start_time)*1000)
         log.info(f"Finished creating dump file. "
                  f"Size: {dump_size} bytes. "
                  f"Duration: {dump_duration} ms")
-
         compressed_size = None
         compression_duration = None
         # Compression
@@ -117,6 +171,7 @@ def run_job(conf):
             compression_cmd = f"gzip {output}"
             compression_start_time = time.time()
             log.info(f"Compressing file: '{output}'")
+            log.debug(f"Compressing file cmd: [{compression_cmd}]")
             check_output(compression_cmd, stderr=STDOUT, shell=True)
             compressed_size = os.stat(f"{output}.gz").st_size
             compression_duration = round((time.time() - compression_start_time)*1000)
@@ -124,14 +179,14 @@ def run_job(conf):
                      f"Size: {compressed_size} bytes. "
                      f"Duration: {compression_duration} ms")
 
-        job_stats = dict(
-            duration=round((time.time() - job_start_time)*1000),
+        stats = dict(
+            name=name,
             duration_dump=dump_duration,
             duration_compression=compression_duration,
             size_dump=dump_size,
             size_compressed=compressed_size
         )
-        return job_stats
+        return stats
     except CalledProcessError as e:
         log.error(f"Backup job has failed after {round((time.time() - job_start_time)*1000)} ms. "
                   f"Error: {e.output}")
@@ -151,37 +206,42 @@ def push_to_prometheus(prometheus_host, prometheus_job, registry):
 
 
 # Upload to AWS s3
-def upload_to_aws(conf, backup):
+def upload_to_aws(configuration, backup_dir):
 
-    global db_backup_status
-    global db_backup_runtime
+    access_key = configuration['access_key']
+    secret_key = configuration['secret_key']
+    bucket_dir_name = f"{configuration['path']}/{os.path.basename(backup_dir)}"
+    bucket_name = configuration['bucket']
 
+    upload_start_time = time.time()
     try:
-        start_time = time.time()
-
-        access_key = conf['access_key']
-        secret_key = conf['secret_key']
-        folder_name = conf['path']
-        bucket_name = conf['bucket']
-        s3_filename = folder_name + os.path.basename(backup)
-
-        log.info(f'Uploading to s3. Bucket: "{bucket_name}", Source: "{backup}", Destination: "{s3_filename}"')
-
+        log.info(f"Running AWS upload for '{backup_dir}'")
         client = boto3.client('s3', aws_access_key_id=access_key, aws_secret_access_key=secret_key)
-        transfer = S3Transfer(client)
-        transfer.upload_file(backup, bucket_name, s3_filename)
 
-        duration = round(time.time() - start_time)
+        # Get files we want to transfer
+        uncompressed_files = glob(f"{backup_dir}/*.sql")
+        compressed_files = glob(f"{backup_dir}/*.gz")
 
-        log.info(f"Successfully uploaded to s3. Time taken: {duration} seconds")
+        files_to_transfer = uncompressed_files + compressed_files
+        if files_to_transfer:
+            transfer = S3Transfer(client)
+            for file in files_to_transfer:
+                s3_file = f"{bucket_dir_name}/{os.path.basename(file)}"
+                log.info(f'Uploading to s3. Bucket: "{bucket_name}", Source: "{file}", Destination: "{s3_file}"')
+                transfer.upload_file(file, bucket_name, s3_file)
+        else:
+            log.warning("Did not find any *.sql or *.gz files in '{backup_dir}'")
 
-        db_backup_runtime.labels('upload').set(duration)
-        db_backup_status.labels('upload').set(1)
+        upload_duration = round((time.time() - upload_start_time) * 1000)
+        log.info(f"Successfully uploaded to s3. Time taken: {upload_duration} ms")
     except Exception as e:
-        duration = round(time.time() - start_time)
-        db_backup_runtime.labels('upload').set(duration)
-        db_backup_status.labels('upload').set(0)
-        raise Exception(f"Upload to s3 has failed: {e}")
+        upload_duration = round((time.time() - upload_start_time) * 1000)
+        raise Exception(f"Upload to s3 has failed after {upload_duration} ms. Error: {e}")
+
+    stats = dict(
+        upload_duration=upload_duration
+    )
+    return stats
 
 
 # App
@@ -190,82 +250,99 @@ if __name__ == '__main__':
     args = parser.parse_args()
     log.debug(f'App args "{args}"')
 
-    conf = get_json_conf(args.conf_file)
+    app_conf = get_json_conf(args.conf_file)
     log.basicConfig(level=log_level_switch(args.log_level))
 
-    backup_db_conf = conf['database']
-    backup_conf = conf['backup']
-    backup_jobs = backup_conf['dumps']
+    backup_db_conf = app_conf['database']
+    backup_conf = app_conf['backup']
 
-    out = backup_conf['output_dir']
-    assert os.path.isdir(out), f"Directory {out} can't be found."
+    backup_dir = backup_conf['output_dir']
+    assert os.path.isdir(backup_dir), f"Directory {backup_dir} can't be found."
 
     ts = dt.datetime.now()
-    out = os.path.abspath(os.path.join(out, f"{ts.strftime('%Y-%m-%d_%H%M%S')}"))
+    output_dir = os.path.abspath(os.path.join(backup_dir, f"{ts.strftime('%Y-%m-%d_%H%M%S')}"))
 
-    for job in backup_jobs:
+    job_stats = []
+    for job in backup_conf['jobs']:
         if job['enabled']:
             job_conf = dict(
                 host=backup_db_conf['host'],
                 db=backup_db_conf['db'],
                 user=backup_db_conf['user'],
                 password=backup_db_conf['password'],
-                util=backup_conf['mysqldump'],
-                output_dir=out,
+                mysqldump_bin=backup_conf['mysqldump_bin'] if 'mysqldump_bin' in backup_conf else 'mysqldump',
+                output_dir=output_dir,
                 name=job['name'],
-                out=out,
                 type=job['type'],
                 compression=job['compression'],
-                excluded=job['excluded'] if 'excluded' in job else [],
-                included=job['included'] if 'included' in job else []
+                exclude=job['exclude'] if 'exclude' in job else [],
+                include=job['include'] if 'include' in job else []
             )
             log.debug(f"Job params: {job_conf}")
             # Run backup job
             try:
-                job_stats = run_job(job_conf)
+                stats = run_job(job_conf)
+                job_stats.append(stats)
             except AssertionError as msg:
                 log.error(msg)
 
-    # TODO add aws upload
-    # TODO add prometheus metrics push
+    # Get AWS config, if it exists
+    aws_enabled = False
+    if 'aws' in app_conf:
+        aws_conf = app_conf['aws']
+        aws_enabled = aws_conf['enabled']
 
-    """
-    aws_enabled = conf['aws']['enabled']
-
-    prometheus_enabled = conf['prometheus']['enabled']
-    prometheus_host = conf['prometheus']['host']
-    prometheus_job = conf['prometheus']['job']
-
-    
-    metric_status_label = conf['prometheus']['labels'][0]['label']
-    metric_status_label_name = conf['prometheus']['labels'][0]['label_name']
-
-    metric_runtime_label = conf['prometheus']['labels'][1]['label']
-    metric_runtime_label_name = conf['prometheus']['labels'][1]['label_name']
-
-    # Prometheus init
-    registry = CollectorRegistry()
-    db_backup_status = Gauge(metric_status_label, metric_status_label_name, ['action'], registry=registry)
-    db_backup_runtime = Gauge(metric_runtime_label, metric_runtime_label_name, ['action'], registry=registry)
-
+    upload_stats = []
     if aws_enabled:
-        upload_to_aws(conf['aws'], local_backup)
-
-        try:
-            log.info(f'Removing local backup "{local_backup}"')
-            os.remove(local_backup)
-            log.info('Removal of local backup has been successful')
-        except Exception as e:
-            log.info(f'Removal of local backup has failed: "{e}"')
+        stats = upload_to_aws(app_conf['aws'], output_dir)
+        upload_stats.append(stats)
     else:
         log.info('Backup upload is disabled')
 
-    try:
-        if prometheus_enabled:
-            log.info('Prometheus is enabled')
-            push_to_prometheus(prometheus_host, prometheus_job, registry)
-        else:
-            log.info('Prometheus is disabled, data will not be sent to prometheus')
-    except Exception as e:
-        log.info(f'Sending data to Prometheus has failed: "{e}"')
-    """
+    # Cleanup, if configured
+    if 'keep_local_backups' in backup_conf:
+        log.debug('Backup retention has been found in config')
+        delete_old_backups(backup_dir, backup_conf['keep_local_backups'])
+
+    if 'prometheus' in app_conf:
+        prometheus_conf = app_conf['prometheus']
+        log.debug('Prometheus gateway has been found in config')
+        try:
+            if prometheus_conf['enabled']:
+                log.info('Prometheus is enabled')
+                # Prometheus init
+                registry = CollectorRegistry()
+
+                if job_stats:
+                    log.info("Found job_stats. Creating gauges")
+                    g_size = Gauge('mysql_backup_size', '', ['backup_job', 'action'], registry=registry)
+                    g_duration = Gauge('mysql_backup_duration', '', ['backup_job', 'action'], registry=registry)
+                    print(job_stats)
+                    for stat in job_stats:
+                        log.info(f"Setting labels: [{stat['name']}, dump] , value: [{stat['size_dump']}]")
+                        g_size.labels(stat['name'], 'dump').set(stat['size_dump'])
+
+                        log.info(f"Setting labels: [{stat['name']}, gzip] , value: [{stat['size_compressed']}]")
+                        g_size.labels(stat['name'], 'gzip').set(stat['size_compressed'])
+
+                        log.info(f"Setting labels: [{stat['name']}, dump] , value: [{stat['duration_dump']}]")
+                        g_duration.labels(stat['name'], 'dump').set(stat['duration_dump'])
+
+                        log.info(f"Setting labels: [{stat['name']}, gzip] , value: [{stat['duration_compression']}]")
+                        g_duration.labels(stat['name'], 'gzip').set(stat['duration_compression'])
+
+                if upload_stats:
+                    for stat in upload_stats:
+                        log.info(f"Setting labels: [aws, upload] , value: [{stat['upload_duration']}]")
+                        g_duration.labels('aws', 'upload').set(stat['upload_duration'])
+
+                if upload_stats or job_stats:
+                    log.info("Sending stats to prometheus gateway")
+                    log.info(f"Prometheus pushgateway host '{prometheus_conf['host']}', job '{prometheus_conf['job']}'")
+                    push_to_prometheus(prometheus_conf['host'], prometheus_conf['job'], registry)
+                else:
+                    log.error("Upload or Job stats not found! Nothing to send to prometheus.")
+            else:
+                log.info('Prometheus is disabled, data will not be sent to prometheus')
+        except Exception as e:
+            log.info(f'Sending data to Prometheus has failed: "{e}"')
