@@ -156,7 +156,4 @@ Pretty straight forward.
 This repo also includes pre-commit config in `.pre-commit-config.yaml`. If you know what it is and how to use it,
 then you will also find useful `requirements-dev.txt`, which includes the packages you need to run pre-commit config included.
 
-## License
-MIT
-
 Happy dumping!
