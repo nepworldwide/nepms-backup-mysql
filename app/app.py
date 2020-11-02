@@ -373,7 +373,8 @@ if __name__ == "__main__":
                         log.debug(
                             f"Setting labels: [{stat['name']}, gzip], value: [{stat['size_compressed']}]"
                         )
-                        g_size.labels(stat["name"], "gzip").set(stat["size_compressed"])
+                        if stat["size_compressed"]:
+                            g_size.labels(stat["name"], "gzip").set(stat["size_compressed"])
 
                         log.debug(
                             f"Setting labels: [{stat['name']}, dump], value: [{stat['duration_dump']}]"
@@ -385,9 +386,8 @@ if __name__ == "__main__":
                         log.debug(
                             f"Setting labels: [{stat['name']}, gzip], value: [{stat['duration_compression']}]"
                         )
-                        g_duration.labels(stat["name"], "gzip").set(
-                            stat["duration_compression"]
-                        )
+                        if stat["size_compressed"]:
+                            g_duration.labels(stat["name"], "gzip").set(stat["duration_compression"])
 
                 if upload_stats:
                     for stat in upload_stats:
